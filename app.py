@@ -1,6 +1,7 @@
 import sys
 import io
 import traceback
+import re
 from typing import TypedDict, List, Optional
 
 from flask import Flask, request, render_template_string, jsonify
@@ -29,6 +30,7 @@ llm_flash = ChatGoogleGenerativeAI(
 
 llm = llm_flash
 
+
 # ==========================================
 # 2. STATE DEFINITION
 # ==========================================
@@ -41,12 +43,159 @@ class CrewState(TypedDict, total=False):
 
 
 # ==========================================
-# 3. TOOLS
+# 3. PYTHON-ONLY GUARDRAIL
+# ==========================================
+
+PYTHON_ONLY_MESSAGE = (
+    "I can't answer this. I can only generate Python code."
+)
+
+
+def is_python_coding_task(task: str) -> bool:
+    """
+    Allow programming/code requests and force them to Python.
+    Reject explicitly requested non-Python languages and
+    reject non-programming/general questions.
+    """
+
+    text = task.strip().lower()
+
+    if not text:
+        return False
+
+    # --------------------------------------
+    # Explicitly requested non-Python languages
+    # --------------------------------------
+
+    non_python_patterns = [
+        r"\bc\+\+\b",
+        r"\bcpp\b",
+        r"\bc plus plus\b",
+        r"\bc language\b",
+        r"\bin c\b",
+        r"\busing c\b",
+        r"\bjava\b",
+        r"\bjavascript\b",
+        r"\btypescript\b",
+        r"\brust\b",
+        r"\bgolang\b",
+        r"\bgo language\b",
+        r"\bkotlin\b",
+        r"\bswift\b",
+        r"\bphp\b",
+        r"\bruby\b",
+        r"\bc#\b",
+        r"\bc sharp\b",
+        r"\bmatlab\b",
+        r"\bscala\b",
+        r"\bperl\b",
+        r"\bdart\b",
+        r"\blua\b",
+        r"\bfortran\b",
+    ]
+
+    for pattern in non_python_patterns:
+        if re.search(pattern, text):
+            return False
+
+    # --------------------------------------
+    # Explicit Python request
+    # --------------------------------------
+
+    if re.search(r"\bpython\b", text):
+        return True
+
+    # --------------------------------------
+    # General programming intent
+    # --------------------------------------
+
+    programming_words = [
+        "code",
+        "program",
+        "script",
+        "function",
+        "class",
+        "algorithm",
+        "implement",
+        "implementation",
+        "programming",
+        "coding",
+        "compile",
+        "debug",
+        "debugging",
+        "syntax",
+        "loop",
+        "variable",
+        "input",
+        "output",
+        "calculator",
+        "game",
+        "app",
+        "application",
+        "automation",
+        "sort",
+        "sorting",
+        "search",
+        "searching",
+        "array",
+        "list",
+        "dictionary",
+        "tuple",
+        "stack",
+        "queue",
+        "matrix",
+        "recursion",
+        "factorial",
+        "fibonacci",
+        "palindrome",
+        "prime number",
+        "prime numbers",
+    ]
+
+    if any(word in text for word in programming_words):
+        return True
+
+    # --------------------------------------
+    # Natural-language coding requests
+    # --------------------------------------
+
+    coding_phrases = [
+        r"\bwrite\b.*\bprogram\b",
+        r"\bwrite\b.*\bcode\b",
+        r"\bwrite\b.*\bscript\b",
+        r"\bcreate\b.*\bprogram\b",
+        r"\bcreate\b.*\bcode\b",
+        r"\bcreate\b.*\bscript\b",
+        r"\bmake\b.*\bprogram\b",
+        r"\bmake\b.*\bcode\b",
+        r"\bmake\b.*\bscript\b",
+        r"\bgenerate\b.*\bprogram\b",
+        r"\bgenerate\b.*\bcode\b",
+        r"\bgenerate\b.*\bscript\b",
+        r"\bwrite\b.*\bseries\b",
+        r"\bgenerate\b.*\bseries\b",
+    ]
+
+    return any(
+        re.search(pattern, text)
+        for pattern in coding_phrases
+    )
+
+
+def guardrail_response(task: str) -> Optional[str]:
+    if not is_python_coding_task(task):
+        return PYTHON_ONLY_MESSAGE
+
+    return None
+
+
+# ==========================================
+# 4. TOOLS
 # ==========================================
 
 @tool
 def run_python_code(code: str) -> str:
-    """Execute Python code and return the output or error."""
+    """Execute Python code and return output or error."""
 
     if not isinstance(code, str):
         code = str(code)
@@ -57,22 +206,39 @@ def run_python_code(code: str) -> str:
         .strip()
     )
 
+    # Never execute the rejection message
+    if clean_code == PYTHON_ONLY_MESSAGE:
+        return PYTHON_ONLY_MESSAGE
+
     old_stdout = sys.stdout
     new_stdout = io.StringIO()
     sys.stdout = new_stdout
 
     try:
         local_scope = {}
-        exec(clean_code, {}, local_scope)
+
+        exec(
+            clean_code,
+            {},
+            local_scope
+        )
+
         result = new_stdout.getvalue()
 
     except Exception:
-        result = f"Execution Error:\n{traceback.format_exc()}"
+        result = (
+            "Execution Error:\n"
+            + traceback.format_exc()
+        )
 
     finally:
         sys.stdout = old_stdout
 
-    return result.strip() if result.strip() else "Success (no terminal output)"
+    return (
+        result.strip()
+        if result.strip()
+        else "Success (no terminal output)"
+    )
 
 
 @tool
@@ -99,11 +265,15 @@ Return only a numbered list.
     content = response.content
 
     if isinstance(content, list):
+
         text_parts = []
 
         for item in content:
+
             if isinstance(item, dict):
-                text_parts.append(item.get("text", ""))
+                text_parts.append(
+                    item.get("text", "")
+                )
             else:
                 text_parts.append(str(item))
 
@@ -113,26 +283,59 @@ Return only a numbered list.
 
 
 # ==========================================
-# 4. GRAPH NODES
+# 5. GRAPH NODES
 # ==========================================
 
 def real_time_developer(state: CrewState):
 
     task = state["messages"][-1].content
 
-    dev_prompt = f"""
-Write a clean Python script to solve this task:
+    # HARD GUARDRAIL
+    rejection = guardrail_response(task)
 
+    if rejection:
+        return {
+            "code": rejection,
+            "report": rejection
+        }
+
+    # --------------------------------------
+    # Python-only developer prompt
+    # --------------------------------------
+
+    dev_prompt = f"""
+You are a STRICT Python-only code generator.
+
+User request:
 {task}
 
 Rules:
-- Return ONLY Python code.
-- Do not use Markdown.
-- Do not use triple backticks.
-- Keep the code simple and executable.
+
+1. Generate ONLY Python code.
+2. Never generate C.
+3. Never generate C++.
+4. Never generate Java.
+5. Never generate JavaScript.
+6. Never generate TypeScript.
+7. Never generate Rust.
+8. Never generate Go.
+9. Never generate Kotlin.
+10. Never generate Swift.
+11. Never generate PHP.
+12. Never generate Ruby.
+13. Never generate C#.
+14. Never generate MATLAB.
+15. Never answer general knowledge questions.
+16. Never answer conversational questions.
+17. Never answer questions unrelated to programming.
+18. Do not explain the answer.
+19. Do not use Markdown.
+20. Do not use triple backticks.
+21. Return ONLY valid Python code.
 """
 
     response = llm_flash.invoke(dev_prompt)
+
     content = response.content
 
     if isinstance(content, list):
@@ -140,8 +343,11 @@ Rules:
         text_parts = []
 
         for item in content:
+
             if isinstance(item, dict):
-                text_parts.append(item.get("text", ""))
+                text_parts.append(
+                    item.get("text", "")
+                )
             else:
                 text_parts.append(str(item))
 
@@ -151,13 +357,16 @@ Rules:
         code_str = str(content).strip()
 
     code_str = (
-        code_str.replace("```python", "")
+        code_str
+        .replace("```python", "")
         .replace("```", "")
         .strip()
     )
 
     if not code_str:
-        raise ValueError("Gemini returned empty code.")
+        raise ValueError(
+            "Gemini returned empty code."
+        )
 
     return {
         "code": code_str
@@ -168,11 +377,23 @@ def real_time_tester(state: CrewState):
 
     task = state["messages"][-1].content
 
-    test_cases = generate_test_cases.invoke(task)
+    # Do not test rejected requests
+    rejection = guardrail_response(task)
 
-    execution_result = run_python_code.invoke({
-        "code": state["code"]
-    })
+    if rejection:
+        return {
+            "report": rejection
+        }
+
+    test_cases = generate_test_cases.invoke(
+        task
+    )
+
+    execution_result = run_python_code.invoke(
+        {
+            "code": state["code"]
+        }
+    )
 
     report = (
         "### EXECUTION OUTPUT:\n"
@@ -187,7 +408,7 @@ def real_time_tester(state: CrewState):
 
 
 # ==========================================
-# 5. GRAPH CONSTRUCTION
+# 6. GRAPH CONSTRUCTION
 # ==========================================
 
 rt_workflow = StateGraph(CrewState)
@@ -221,7 +442,7 @@ rt_app = rt_workflow.compile()
 
 
 # ==========================================
-# 6. WEB INTERFACE
+# 7. WEB INTERFACE
 # ==========================================
 
 HTML = """
@@ -306,12 +527,12 @@ HTML = """
     <div class="card">
 
         <p>
-            Enter a Python coding task:
+            Enter a Python coding task only:
         </p>
 
         <textarea
             id="task"
-            placeholder="Example: Write a Python program to generate Fibonacci series up to 10 terms"
+            placeholder="Example: Write a Fibonacci series"
         ></textarea>
 
         <button onclick="runAgent()">
@@ -335,18 +556,25 @@ HTML = """
 async function runAgent() {
 
     const task =
-        document.getElementById("task").value.trim();
+        document
+        .getElementById("task")
+        .value
+        .trim();
 
     const result =
-        document.getElementById("result");
+        document
+        .getElementById("result");
 
     const loading =
-        document.getElementById("loading");
+        document
+        .getElementById("loading");
 
 
     if (!task) {
 
-        alert("Please enter a coding task.");
+        alert(
+            "Please enter a Python coding task."
+        );
 
         return;
     }
@@ -359,21 +587,22 @@ async function runAgent() {
 
     try {
 
-        const response = await fetch(
-            "/run",
-            {
-                method: "POST",
+        const response =
+            await fetch(
+                "/run",
+                {
+                    method: "POST",
 
-                headers: {
-                    "Content-Type":
-                        "application/json"
-                },
+                    headers: {
+                        "Content-Type":
+                            "application/json"
+                    },
 
-                body: JSON.stringify({
-                    task: task
-                })
-            }
-        );
+                    body: JSON.stringify({
+                        task: task
+                    })
+                }
+            );
 
 
         const data =
@@ -386,6 +615,7 @@ async function runAgent() {
                 data.error ||
                 "Request failed"
             );
+
         }
 
 
@@ -418,9 +648,8 @@ ${escapeHtml(data.report)}
 
         `;
 
-    }
 
-    catch (error) {
+    } catch (error) {
 
         result.innerHTML = `
 
@@ -438,9 +667,7 @@ ${escapeHtml(error.message)}
 
         `;
 
-    }
-
-    finally {
+    } finally {
 
         loading.style.display = "none";
 
@@ -489,93 +716,127 @@ function escapeHtml(text) {
 
 
 # ==========================================
-# 7. HOME ROUTE
+# 8. FLASK ROUTES
 # ==========================================
 
-@app.route("/", methods=["GET"])
+@app.route(
+    "/",
+    methods=["GET"]
+)
 def home():
 
-    return render_template_string(HTML)
+    return render_template_string(
+        HTML
+    )
 
 
-# ==========================================
-# 8. HEALTH CHECK ROUTE
-# ==========================================
-
-@app.route("/health", methods=["GET"])
-def health():
-
-    return jsonify({
-        "status": "ok",
-        "message": "AI Coding Crew is running"
-    })
-
-
-# ==========================================
-# 9. RUN AGENT ROUTE
-# ==========================================
-
-@app.route("/run", methods=["POST"])
+@app.route(
+    "/run",
+    methods=["POST"]
+)
 def run_task():
 
     try:
 
-        data = request.get_json(
-            silent=True
-        ) or {}
+        data = (
+            request
+            .get_json(
+                silent=True
+            )
+            or {}
+        )
 
         task = str(
-            data.get("task", "")
+            data.get(
+                "task",
+                ""
+            )
         ).strip()
 
 
         if not task:
 
-            return jsonify({
-                "error":
-                "Please provide a coding task."
-            }), 400
+            return jsonify(
+                {
+                    "error":
+                    "Please provide a coding task."
+                }
+            ), 400
+
+
+        # ==================================
+        # HARD API-LEVEL GUARDRAIL
+        # ==================================
+
+        rejection = guardrail_response(
+            task
+        )
+
+        if rejection:
+
+            return jsonify(
+                {
+                    "code": rejection,
+                    "report": rejection
+                }
+            )
 
 
         state = {
+
             "messages": [
                 HumanMessage(
                     content=task
                 )
             ]
+
         }
 
 
         result = rt_app.invoke(
+
             state,
+
             config={
                 "recursion_limit": 20
             }
+
         )
 
 
-        return jsonify({
+        return jsonify(
 
-            "code":
-                result.get("code", ""),
+            {
+                "code":
+                    result.get(
+                        "code",
+                        ""
+                    ),
 
-            "report":
-                result.get("report", "")
+                "report":
+                    result.get(
+                        "report",
+                        ""
+                    )
+            }
 
-        })
+        )
 
 
     except Exception as e:
 
-        return jsonify({
+        return jsonify(
 
-            "error": str(e)
+            {
+                "error":
+                    str(e)
+            }
 
-        }), 500
+        ), 500
 
 
 # ==========================================
-# 10. START APPLICATION
+# 9. START SERVER
 # ==========================================
 
 if __name__ == "__main__":
